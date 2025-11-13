@@ -13,7 +13,7 @@ class RunJobStep(WorkflowStep):
     async def execute(self, context: StepContext) -> StepContext:
         await self.task_store.update_task(
             context.task_id,
-            status=TaskStatus.JOB_RUNNING
+            status=TaskStatus.PROCESSING
         )
 
         params = dict(context.job_params or {})
@@ -32,7 +32,6 @@ class RunJobStep(WorkflowStep):
         
         await self.task_store.update_task(
             context.task_id,
-            status=TaskStatus.PROCESSING,
             result={
                 **current_result,
                 "run_id": context.run_id,
