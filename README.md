@@ -1,41 +1,99 @@
-## DARA - The Databricks Async REST API Framework for Apps
+## The Databricks Async REST API Framework for Apps
 
-DARA is a FastAPI framework for building REST APIs that orchestrate Databricks activities. It provides a composable, [pipeline-based architecture](https://en.wikipedia.org/wiki/Pipeline_(software)) for managing async workflows with built-in task tracking, job execution, and monitoring. Use DARA to integrate Databricks workflow execution into your other Databricks apps. For example, your app users can upload and process raw files, inserting contents into a Vector Index for Agent consumption.
+A framework for building REST APIs to orchestrate Databricks activities. This framework provides a composable, [pipeline-based architecture](https://en.wikipedia.org/wiki/Pipeline_(software)) for managing async workflows with built-in task tracking, job execution, and monitoring.  It lets you trigger multiple Databricks activities with a single API call, ready to plug into your other Databricks apps.  
+ 
+For example: 
+
+![Alt text describing the image](img/use_case_example.svg)
+
 
 ### Concepts:
 **Steps:**  
+![Alt text describing the image](img/steps.svg)
 
-Steps are individual and independent processing steps, such as uploading a file or running a Databricks job. Steps have a common interface (the execute method). They also share state, a StepContext. Steps require a StepContext as an input and return an updated StepContext. Steps are chained together using a WorkflowPipeline, which executes steps in a sequenced, passing the update state from one step to the next. You can create new steps to trigger any Databricks activies accesseable via the [Databricks Rest API](https://docs.databricks.com/api/workspace/introduction) (see caveates below).
+Steps are individual and independent processing units, such as uploading a file or running a Databricks job. Steps have a common interface (the execute method). They also share state, a StepContext. Steps require a StepContext as an input and return an updated StepContext. This allows Steps to share information, such as a file location or job id with proceeding Steps in your workflow. You can create new Steps to trigger any Databricks activity accessible by the [Databricks Rest API](https://docs.databricks.com/api/workspace/introduction).
+
 
 **WorkflowPipeline:**  
+![Alt text describing the image](img/workflow_pipeline.svg)  
 
-Executes a workflow definition (series of steps). Workflow defitions are defined in the definitions directory. WorkflowPipelines are ultimately triggered to execute a sequence of steps you've definined.
-
-**WorkflowExecutor:**
-
-The entry point for all WorkflowPipeline execution. The WorkflowExecutor has a reference to all available workflow definitions. It configures the initial state of the workflow, creates a unique workflow id, and executes the relevent WorkflowPipeline. The Fast API routes defined in v1/workflow.py call the WorkflowExecutor.
+Steps are executed in a sequence using a WorkflowPipeline, passing the updated StepContext from one Step to the next. Since Steps are independent of one another, a WorkflowPipeline can chain any arbitrary Databricks activities together into a single API call. Steps report on their progress by updating the TaskStore (implementation in Redis and Lakebase, but extendable to others). This allows every workflow to be monitored end to end, even though several Databricks APIs may be triggered. The status of any workflow can be accessed via GET /workflow/status/{task_id}.
 
 
-#### To create your own workflow, follow these steps.  
+**WorkflowExecutor:**  
+![Alt text describing the image](img/workflow_executor.svg)
 
-1. Create a new step if one that performs the action you need does not already exist.
+The entry point for WorkflowPipeline executions, the WorkflowExecutor loads the requested workflow pipeline for an API request, creates a new task_id in the Task Store, configures the initial StepContext, and triggers the pipeline's execution. Fast API routes trigger pipelines using this executor.
 
-2. Consider if you need to update the StepContext data class to include more parameters. This is the information relvent to your step that can be shared with other steps, for example, a job id that will need to be referenced by proceeding steps.
+**TaskStore:**  
+![Alt text describing the image](img/task_store.svg)
 
-3. Create a new workflow definition that defines the series of steps you want to execute, such as upload a file to a UC volume, execute a job that processes that file, etc.
+A backend that monitors pipeline execution status. TaskStores are provided for Lakebase and Redis, simply set TASK_STORE_BACKEND to use your desired host (lakebase or redis). TaskStore provides a standard interface to easily integrate other backend databases.
 
-4. At the new workflow information to the WorkflowExecutor, which your Fast API routes will call.
+####To configure the app
+See the .env.example file for a list of environment variables required to deploy your app. This file is used to define environment variables for local development. Environment variables must also exist in app_example.yaml for Databricks Apps deployment. Don't forget to remove 'example' from your own file versions!
 
-5. Add a new Fast API route to your v1/workflow file that triggers your new workflow definition.  
+To quickly validate your TaskStore connection locally, use one of the below examples.
 
-<br>
-<br>
+Lakebase:
+```
+from dotenv import load_dotenv
 
-**Special notes:**  
+load_dotenv()
 
-This project leverages asyncio and is fully asynchronous. Since the Databricks Python SDK  operations are synchronous, this project implements its own async Databricks REST API client. When adding new steps, you may need to add a new entry in `client.py` to call the relevant Databricks API asynchronously.
+import asyncio
+from dotenv import load_dotenv
+from rest_api.services.task_store.postgres_store import PostgreSQLTaskStore
 
-The project also implements a task store using Redis. The task store allows tasks to be 
-tracked over time. For instance, a task can be launched that may take several minutes. 
-Steps update the task's state in the task store, allowing for features like task polling 
-by exposing a `GET /api/v1/workflow/status/{task_id}` route in FastAPI.
+
+async def check_postgres_store():
+    store = PostgreSQLTaskStore()
+    pool = await store._get_pool()
+    async with pool.acquire() as conn:
+        value = await conn.fetchval("SELECT 1")
+        print(f"Connection OK, SELECT 1 -> {value}")
+    await store.close()
+
+asyncio.run(check_postgres_store())
+```  
+
+Redis:
+```
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import asyncio
+from rest_api.services.task_store.redis_store import RedisTaskStore
+
+async def check_redis_store():
+    store = RedisTaskStore()
+    redis = await store._get_redis()
+    pong = await redis.ping()
+    print(f"Redis ping -> {pong}")
+
+    # Optional: do a basic set/get round-trip
+    await redis.set("taskstore:test", "ok", ex=10)
+    value = await redis.get("taskstore:test")
+    print(f"Redis round-trip value -> {value}")
+
+    await store.close()
+
+asyncio.run(check_redis_store())
+```
+
+#### To add your own, custom Steps and Workflows, follow these steps. 
+
+1. Review the available Steps in `workflows/steps` to determine if the Step you need is already available.
+2. If the Steps are available, determine if the Workflow you need is already available in `workflows/definitions`,
+3. You can easily create your own custom Steps and Workflows by adopting the standard interfaces shown in the above files. To start...
+     - Confirm that `services/client.py` contains the Databricks REST API calls you need. If not, simply add them.
+     - Determine if the StepContext class in `workflows/pipeline.py` has all the necessary fields you want to record your  Step's activities. If not, simply add them.
+     - Create your own Step following the examples in `workflows/steps`. Your step should update the StepContext and TaskStore, following the patterns in the examples.
+     - Create a new workflow definition in `workflows/definitions`.
+     - Update the WorkflowExecutor's workflow parameter in `workflows/executor.py`.
+     - Add a FastAPI route to call your workflow (through the WorkflowExecutor) in `v1/endpoints`.
+
+
+#### NOTES:
+An example workflow will soon be available!
