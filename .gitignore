@@ -5,6 +5,8 @@
 .databricks
 /examples
 app.yaml
+/docs
+/migrations
 
 # Mac
 .DS_Store

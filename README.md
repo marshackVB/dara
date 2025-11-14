@@ -4,29 +4,29 @@ A framework for building REST APIs to orchestrate Databricks activities. This fr
  
 For example: 
 
-![Alt text describing the image](img/use_case_example.svg)
+<img src="img/use_case_example.svg" alt="Alt text" width="600">
 
 
 ### Concepts:
 **Steps:**  
-![Alt text describing the image](img/steps.svg)
+<img src="img/steps.svg" alt="Alt text" width="600">
 
 Steps are individual and independent processing units, such as uploading a file or running a Databricks job. Steps have a common interface (the execute method). They also share state, a StepContext. Steps require a StepContext as an input and return an updated StepContext. This allows Steps to share information, such as a file location or job id with proceeding Steps in your workflow. You can create new Steps to trigger any Databricks activity accessible by the [Databricks Rest API](https://docs.databricks.com/api/workspace/introduction).
 
 
 **WorkflowPipeline:**  
-![Alt text describing the image](img/workflow_pipeline.svg)  
+<img src="img/workflow_pipeline.svg" alt="Alt text" width="700">
 
 Steps are executed in a sequence using a WorkflowPipeline, passing the updated StepContext from one Step to the next. Since Steps are independent of one another, a WorkflowPipeline can chain any arbitrary Databricks activities together into a single API call. Steps report on their progress by updating the TaskStore (implementation in Redis and Lakebase, but extendable to others). This allows every workflow to be monitored end to end, even though several Databricks APIs may be triggered. The status of any workflow can be accessed via GET /workflow/status/{task_id}.
 
 
 **WorkflowExecutor:**  
-![Alt text describing the image](img/workflow_executor.svg)
+<img src="img/workflow_executor.svg" alt="Alt text" width="600">
 
 The entry point for WorkflowPipeline executions, the WorkflowExecutor loads the requested workflow pipeline for an API request, creates a new task_id in the Task Store, configures the initial StepContext, and triggers the pipeline's execution. Fast API routes trigger pipelines using this executor.
 
 **TaskStore:**  
-![Alt text describing the image](img/task_store.svg)
+<img src="img/task_store.svg" alt="Alt text" width="600">
 
 A backend that monitors pipeline execution status. TaskStores are provided for Lakebase and Redis, simply set TASK_STORE_BACKEND to use your desired host (lakebase or redis). TaskStore provides a standard interface to easily integrate other backend databases.
 

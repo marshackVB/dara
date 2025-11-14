@@ -44,7 +44,7 @@ class WorkflowExecutor:
         # Extract job_id if provided (workflows that need it can validate)
         job_id = kwargs.pop('job_id', None)
         
-        # Create task in Redis (without file_contents - only store JSON-serializable params)
+        # Create task in the backend store (without file_contents - only store JSON-serializable params)
         task_id = str(uuid4())
         await self.task_store.create_task(
             task_id=task_id,

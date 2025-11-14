@@ -78,7 +78,14 @@ class PostgreSQLTaskStore(TaskStore):
     - Validates environment/configuration settings (schema, table, pool size).
     - Exposes the public async API (create/get/update/delete) while translating
       to/from JSON payloads and SQL rows.
-    - Manages the Lakehouse connection pool and schema/table/index auto-creation."""
+    - Manages the Lakehouse connection pool and schema/table/index auto-creation.
+
+    Note that postgresql does not have native time to live (ttl) functionality that
+    deletes records as they expire. This postgresql task store does store an expires_at
+    timestamp that can be used to periodically deleted records outside of the app. For 
+    instance, by executing a query such as,
+    
+    DELETE FROM workflow_tasks WHERE expires_at IS NOT NULL AND expires_at < now()"""
     def __init__(
         self,
         dsn: Optional[str] = None,

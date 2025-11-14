@@ -1,3 +1,8 @@
+"""
+Databricks async workspace client
+See the docs at https://docs.databricks.com/api/workspace/introduction
+"""
+
 import os
 import time
 from typing import Optional, Dict, Any
@@ -7,6 +12,10 @@ import httpx
 
 
 class DatabricksClient:
+    """An async wrapper around the Databricks REST API. Using awaitable calls 
+    keeps FastAPI's event loop from being blocked by API calls, so requests don't 
+    get serialized under load."""
+
     def __init__(
         self, 
         workspace_url: Optional[str] = None,
@@ -88,11 +97,15 @@ class DatabricksClient:
         Trigger a Databricks job run.
 
         Args:
-        job_id: The ID of the Databricks job to run.
-        **kwargs: Additional parameters(notebook_params, python_params, etc.)
+            job_id: The ID of the Databricks job to run.
+            **kwargs: Additional parameters(notebook_params, python_params, etc.)
 
         Returns:
             Response with run_id
+
+        Notes: 
+            The /api/2.2/jobs/runs/submit API is also of interest here. This API
+            runs a job without creating a Workflow in the UI.
         """
         client = await self._get_client()
         response = await client.post(
@@ -112,6 +125,10 @@ class DatabricksClient:
 
         Returns:
             Run status information
+
+        Notes:
+            The /api/2.2/jobs/runs/get-output is also of interest here; it returns 
+            a value returned by a Notebook that uses dbutils.notebook.exit()
         """
         client = await self._get_client()
         response = await client.get(
