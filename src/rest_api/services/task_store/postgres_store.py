@@ -12,19 +12,15 @@ import asyncpg
 import json
 from .base import TaskStatus, TaskStore
 
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    """Parse boolean environment variables."""
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _env_int(name: str, default: int) -> int:
-    """Parse integer environment variables."""
+    """Ensure that environment variables expected to be integers can
+    actually be parsed as an integers. If no environmen variable is available,
+    return a default value. Used to validate the sql pools max size but could
+    be used for additional variables added."""
     value = os.getenv(name)
     if value is None:
         return default
@@ -33,9 +29,21 @@ def _env_int(name: str, default: int) -> int:
     except ValueError as exc:
         raise ValueError(f"Environment variable {name} must be an integer.") from exc
 
+def _require_env(name: str, description: str) -> str:
+    """
+    Confirm that required environment variables are available and 
+    return an informative message if they aren't.
+    """
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"{name} must be set for Lakehouse authentication ({description}).")
+    return value
 
 def _validate_identifier(value: str, label: str) -> str:
-    """Ensure SQL identifiers are safe to interpolate."""
+    """Ensure any schema and/or tables names passed via TASK_STORE_POSTGRES_SCHEMA 
+    / TASK_STORE_POSTGRES_TABLE conform to postgres naming conventions. Prevents
+    SQL injection / invalid names.Names in SQL must begin with a letter (a-z) or underscore (_). 
+    Subsequent characters in a name can be letters, digits (0-9), or underscores"""
     if not value:
         raise ValueError(f"{label} cannot be empty.")
     if not _IDENTIFIER_RE.match(value):
@@ -46,29 +54,31 @@ def _validate_identifier(value: str, label: str) -> str:
         )
     return value
 
-
 def _coerce_status(status: TaskStatus | str) -> TaskStatus:
-    """Ensure we always work with TaskStatus enum values."""
+    """Ensure we always work with TaskStatus enum values. This allows either the
+    enum value or valid enum string representation to be passed via an API call;
+    either way the enum value will be returned."""
     if isinstance(status, TaskStatus):
         return status
     return TaskStatus(str(status))
 
-
 def _isoformat(dt: Optional[datetime]) -> Optional[str]:
+    """Ensure date values are always iso formattted"""
     return dt.isoformat() if dt else None
-
 
 @dataclass
 class _ConnectionConfig:
     """Holds connection configuration for asyncpg.create_pool."""
-
     kwargs: Dict[str, Any]
     dsn: Optional[str] = None
 
-
 class PostgreSQLTaskStore(TaskStore):
-    """PostgreSQL implementation of the TaskStore abstraction."""
+    """PostgreSQL implementation of the TaskStore abstraction.
 
+    - Validates environment/configuration settings (schema, table, pool size).
+    - Exposes the public async API (create/get/update/delete) while translating
+      to/from JSON payloads and SQL rows.
+    - Manages the Lakehouse connection pool and schema/table/index auto-creation."""
     def __init__(
         self,
         dsn: Optional[str] = None,
@@ -78,20 +88,26 @@ class PostgreSQLTaskStore(TaskStore):
         ttl_seconds: Optional[int] = None,
         max_pool_size: Optional[int] = None,
     ) -> None:
+
+        # Validate postgresql configuration for backend store
         self._connection_config = self._build_connection_config(dsn)
 
         self.schema = _validate_identifier(
             (schema or os.getenv("TASK_STORE_POSTGRES_SCHEMA") or "public"),
             "schema",
         )
+
         self.table = _validate_identifier(
             (table or os.getenv("TASK_STORE_POSTGRES_TABLE") or "workflow_tasks"),
             "table",
         )
+
         self._qualified_table = (
             f'{self._quote_identifier(self.schema)}.{self._quote_identifier(self.table)}'
         )
+
         self._status_index = _validate_identifier(f"{self.table}_status_idx", "index")
+
         self._created_at_index = _validate_identifier(
             f"{self.table}_created_at_idx", "index"
         )
@@ -99,9 +115,11 @@ class PostgreSQLTaskStore(TaskStore):
         ttl_env = os.getenv("TASK_STORE_TTL_SECONDS")
         if ttl_seconds is not None:
             self.ttl_seconds = ttl_seconds if ttl_seconds > 0 else None
+
         elif ttl_env:
             parsed = int(ttl_env)
             self.ttl_seconds = parsed if parsed > 0 else None
+
         else:
             self.ttl_seconds = 86400  # 24 hours default
 
@@ -109,15 +127,13 @@ class PostgreSQLTaskStore(TaskStore):
             self.ttl_seconds = None
 
         self.max_pool_size = max_pool_size or _env_int(
-            "TASK_STORE_POSTGRES_POOL_SIZE", default=10
+            "TASK_STORE_POSTGRES_POOL_SIZE", default = 10
         )
 
         self._pool: Optional[asyncpg.Pool] = None
+        self._ddl_initialized: bool = False
 
-    # ------------------------------------------------------------------ #
     # Public API
-    # ------------------------------------------------------------------ #
-
     async def create_task(
         self,
         task_id: str,
@@ -125,6 +141,10 @@ class PostgreSQLTaskStore(TaskStore):
         params: Dict,
         status: TaskStatus = TaskStatus.PENDING,
     ) -> Dict:
+    """Insert a new task row and return the dictionary shape used by the API. 
+    The WorkflowExecutor supplies the task fields as JSON-friendly values; this
+    method persists them in Postgres and returns the normalized payload the
+    FastAPI routes expect."""
         created_at = datetime.now(timezone.utc)
         expires_at = (
             created_at + timedelta(seconds=self.ttl_seconds)
@@ -199,6 +219,9 @@ class PostgreSQLTaskStore(TaskStore):
         return self._serialize_row(row)
 
     async def update_task(self, task_id: str, **updates) -> Optional[Dict]:
+        """To update a task, fetch the task's current row values. If the update is a
+        task status update, determine if the task update requires start time or end time
+        to be updated. If the update is of another type, overwrites"""
         async with self._connection() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -308,11 +331,45 @@ class PostgreSQLTaskStore(TaskStore):
     async def close(self) -> None:
         if self._pool:
             await self._pool.close()
-            self._pool = None
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
+    def _build_connection_config(self, dsn: Optional[str]) -> _ConnectionConfig:
+        """Collect the Lakebase connection information that will be used to establish
+        the asyncpg connection pool."""
+        if dsn:
+            return _ConnectionConfig(kwargs={}, dsn=dsn)
+
+        host = _require_env("LAKEBASE_HOST", "hostname of the Lakehouse Postgres instance")
+        port = int(_require_env("LAKEBASE_PORT", "port number"))
+        role = _require_env("LAKEBASE_ROLE", "database role/user")
+        password = _require_env("LAKEBASE_PASSWORD", "database role password")
+        database = _require_env("LAKEBASE_DB_NAME", "target database name")
+        instance_name = os.getenv("LAKEBASE_INSTANCE_NAME")
+
+        kwargs: Dict[str, Any] = {
+            "host": host,
+            "port": port,
+            "user": role,
+            "database": database,
+            "password": password,
+        }
+        return _ConnectionConfig(kwargs=kwargs, dsn=None)
+
+    async def _init_connection(self, conn: asyncpg.Connection) -> None:
+        """Install custom codecs so asyncpg automatically JSON-encodes Python dicts
+        and decodes JSON/JSONB columns back into native Python objects."""
+        await conn.set_type_codec(
+            "json",
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+            self._pool = None
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is None:
@@ -329,61 +386,53 @@ class PostgreSQLTaskStore(TaskStore):
 
     @asynccontextmanager
     async def _connection(self) -> asyncpg.Connection:
+        """Acquire a connection from the asyncpg pool, ensure the schema/table/index
+        exist on first use, yield it for the caller’s query, and release it back
+        to the pool afterward."""
         pool = await self._get_pool()
-        conn = await pool.acquire()
+        conn = await pool.acquire()  # acquire a connection from the persisted pool
         try:
-            if self.schema != "public":
-                await conn.execute(
-                    f'CREATE SCHEMA IF NOT EXISTS {self._quote_identifier(self.schema)}'
-                )
+            if not self._ddl_initialized:
+                if self.schema != "public":
+                    await conn.execute(
+                        f'CREATE SCHEMA IF NOT EXISTS {self._quote_identifier(self.schema)}'
+                    )
 
-            await conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self._qualified_table} (
-                    id TEXT PRIMARY KEY,
-                    task_type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    started_at TIMESTAMPTZ,
-                    completed_at TIMESTAMPTZ,
-                    params JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    result JSONB,
-                    error TEXT,
-                    expires_at TIMESTAMPTZ
+                await conn.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self._qualified_table} (
+                        id TEXT PRIMARY KEY,
+                        task_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        started_at TIMESTAMPTZ,
+                        completed_at TIMESTAMPTZ,
+                        params JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        result JSONB,
+                        error TEXT,
+                        expires_at TIMESTAMPTZ
+                    )
+                    """
                 )
-                """
-            )
-            await conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS {self._quote_identifier(self._status_index)}
-                ON {self._qualified_table} (status)
-                """
-            )
-            await conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS {self._quote_identifier(self._created_at_index)}
-                ON {self._qualified_table} (created_at)
-                """
-            )
+                await conn.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._quote_identifier(self._status_index)}
+                    ON {self._qualified_table} (status)
+                    """
+                )
+                await conn.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._quote_identifier(self._created_at_index)}
+                    ON {self._qualified_table} (created_at)
+                    """
+                )
+                self._ddl_initialized = True
             yield conn
         finally:
-            await pool.release(conn)
-
-    async def _init_connection(self, conn: asyncpg.Connection) -> None:
-        await conn.set_type_codec(
-            "json",
-            encoder=json.dumps,
-            decoder=json.loads,
-            schema="pg_catalog",
-        )
-        await conn.set_type_codec(
-            "jsonb",
-            encoder=json.dumps,
-            decoder=json.loads,
-            schema="pg_catalog",
-        )
+            await pool.release(conn)  # return the connection to the pool
 
     def _serialize_row(self, row: asyncpg.Record) -> Dict[str, Any]:
+        """Return a JSON-ready task dict with ISO8601 timestamps and normalized data."""
         return self._serialize_task(
             task_id=row["id"],
             task_type=row["task_type"],
@@ -411,6 +460,9 @@ class PostgreSQLTaskStore(TaskStore):
         completed_at: Optional[datetime],
         expires_at: Optional[datetime],
     ) -> Dict[str, Any]:
+        """Normalize database values into the task payload shape used by the API.
+        Converts datetimes to ISO8601 strings, ensures params/results are JSON-friendly,
+        and keeps all standard fields (status, timestamps, error, etc.) in one dict."""
         return {
             "id": task_id,
             "task_type": task_type,
@@ -426,6 +478,8 @@ class PostgreSQLTaskStore(TaskStore):
 
     @staticmethod
     def _coerce_datetime(value: Any) -> Optional[datetime]:
+        """Accept either a datetime or ISO8601 string (or None) and return a timezone-aware
+        UTC datetime. Used to normalize timestamps coming from the database or API payloads."""
         if value is None:
             return None
         if isinstance(value, datetime):
@@ -441,44 +495,5 @@ class PostgreSQLTaskStore(TaskStore):
 
     @staticmethod
     def _quote_identifier(identifier: str) -> str:
+        """Return an identifier wrapped in double quotes so it is safe to embed in SQL statements."""
         return f'"{identifier}"'
-
-    def _build_connection_config(self, dsn: Optional[str]) -> _ConnectionConfig:
-        if dsn:
-            return _ConnectionConfig(kwargs={}, dsn=dsn)
-
-        host = os.getenv("LAKEBASE_HOST")
-        if not host:
-            raise ValueError(
-                "PostgreSQL configuration is missing. Set LAKEBASE_HOST "
-                "to the hostname of your Lakehouse Postgres instance."
-            )
-
-        port = int(os.getenv("LAKEBASE_PORT") 
-        )
-        if not port:
-            raise ValueError("LAKEBASE_PORT must be set for Lakehouse authentication.")
-
-        role = os.getenv("LAKEBASE_ROLE")
-        if not role:
-            raise ValueError("LAKEBASE_ROLE must be set for Lakehouse authentication.")
-
-        password = os.getenv("LAKEBASE_PASSWORD")
-        if not password:
-            raise ValueError("LAKEBASE_PASSWORD must be set for Lakehouse authentication.")
-
-        database = os.getenv("LAKEBASE_DB_NAME")
-        if not database:
-            raise ValueError("LAKEBASE_DB_NAME must be set to select the target database.")
-
-        instance_name = os.getenv("LAKEBASE_INSTANCE_NAME")
-
-        kwargs: Dict[str, Any] = {
-            "host": host,
-            "port": port,
-            "user": role,
-            "database": database,
-            "password": password,
-        }
-        return _ConnectionConfig(kwargs=kwargs, dsn=None)
-
