@@ -1,0 +1,13 @@
+command: ["uvicorn", "rest_api.app:app"]
+
+env:
+  - name: PYTHONPATH
+    value: src
+  # Place all environment variables used in .env for local developmen here
+  # assuming those values must be accessible by Databricks apps
+  # Store sensative credententials as Databricks secrets, then add them 
+  # as resources to the app. You can then access those secrets in this file
+  # using the format (where lakebase_password is the name of the resource
+  # associated with the app)
+  #- name: LAKEBASE_PASSWORD
+  #  valueFrom: lakebase_password
