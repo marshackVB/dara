@@ -14,14 +14,21 @@ from .base import TaskStatus, TaskStore
 
 class RedisTaskStore(TaskStore):
     """
-    Redis-backed task store for tracking workflow execution.
+    Redis-backed task store used for tracking workflow execution.
 
-    Tasks are stored as JSON with TTL for automatic cleanup.
-    Supports both URL format and individual host/port/password configuration.
+    - Stores task payloads as JSON values with an expiration (TTL) for automatic cleanup.
+    - Supports both a single `REDIS_URL` and individual host/port/password environment variables.
+    - Implements the same public interface as the PostgreSQLTaskStore so routes can remain agnostic.
     """
 
     def __init__(self, redis_url: Optional[str] = None, ttl_seconds: int = 86400):
-        # Support both URL format and individual parameters
+        """
+        Configure the Redis connection URL and TTL.
+
+        Args:
+            redis_url: Optional Redis URL. Falls back to env vars when omitted.
+            ttl_seconds: Number of seconds before a task entry expires (default 24h).
+        """
         redis_url = redis_url or os.getenv("REDIS_URL")
 
         # If REDIS_URL not set, try individual parameters (like redis_om pattern)
@@ -49,7 +56,7 @@ class RedisTaskStore(TaskStore):
         self.ttl_seconds = ttl_seconds  # 24 hours by default
 
     async def _get_redis(self) -> aioredis.Redis:
-        """Get or create Redis connection."""
+        """Get or lazily create the shared Redis connection with basic connectivity checks."""
         if self.redis is None:
             try:
                 self.redis = aioredis.from_url(
@@ -76,7 +83,7 @@ class RedisTaskStore(TaskStore):
         params: Dict,
         status: TaskStatus = TaskStatus.PENDING,
     ) -> Dict:
-        """Create a new task."""
+        """Create a new task entry and return the JSON payload that was stored."""
         task = {
             "id": task_id,
             "task_type": task_type,
@@ -95,7 +102,7 @@ class RedisTaskStore(TaskStore):
         return task
 
     async def get_task(self, task_id: str) -> Optional[Dict]:
-        """Retrieve a task by ID."""
+        """Retrieve a task by ID, returning the stored JSON as a dictionary if found."""
         redis = await self._get_redis()
         key = f"{self.task_prefix}{task_id}"
         data = await redis.get(key)
@@ -104,7 +111,8 @@ class RedisTaskStore(TaskStore):
         return None
 
     async def update_task(self, task_id: str, **updates) -> Optional[Dict]:
-        """Update task fields."""
+        """Update the task payload in-place, adjusting status-derived timestamps when needed.
+        Returns the updated task dict, or None if the task does not exist."""
         task = await self.get_task(task_id)
         if not task:
             return None
@@ -138,13 +146,13 @@ class RedisTaskStore(TaskStore):
         return task
 
     async def delete_task(self, task_id: str) -> None:
-        """Delete a task."""
+        """Delete a task entry from Redis."""
         redis = await self._get_redis()
         key = f"{self.task_prefix}{task_id}"
         await redis.delete(key)
 
     async def close(self) -> None:
-        """Close Redis connection."""
+        """Close the shared Redis connection (idempotent)."""
         if self.redis:
             await self.redis.aclose()
             self.redis = None
