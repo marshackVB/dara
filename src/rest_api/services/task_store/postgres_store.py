@@ -148,10 +148,10 @@ class PostgreSQLTaskStore(TaskStore):
         params: Dict,
         status: TaskStatus = TaskStatus.PENDING,
     ) -> Dict:
-    """Insert a new task row and return the dictionary shape used by the API. 
-    The WorkflowExecutor supplies the task fields as JSON-friendly values; this
-    method persists them in Postgres and returns the normalized payload the
-    FastAPI routes expect."""
+        """Insert a new task row and return the dictionary shape used by the API. 
+        The WorkflowExecutor supplies the task fields as JSON-friendly values; this
+        method persists them in Postgres and returns the normalized payload the
+        FastAPI routes expect."""
         created_at = datetime.now(timezone.utc)
         expires_at = (
             created_at + timedelta(seconds=self.ttl_seconds)
@@ -376,7 +376,7 @@ class PostgreSQLTaskStore(TaskStore):
             decoder=json.loads,
             schema="pg_catalog",
         )
-            self._pool = None
+        self._pool = None
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is None:
